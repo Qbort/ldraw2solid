@@ -66,8 +66,10 @@ def main():
             failed += 1
             continue
         st, r = solid.stats, validate(solid, flat)
-        print(f"  repairs: {st['tjunction_verts']} T-junction vertices, "
-              f"{st['loops_planar']} planar + {st['loops_nonplanar']} non-planar loops capped, "
+        print(f"  repairs: {st['tjunction_verts']} T-junction vertices, {st['sorted_edges']} edges with 3+ faces, "
+              f"{st['loops']} loops capped ({st['loops_split']} split into planes, {st['loops_fanned']} fanned"
+              f"{', %d retried' % st['loops_retried'] if st['loops_retried'] else ''}), "
+              f"{'%d double-wall planes cut, ' % st['double_wall_cuts'] if st['double_wall_cuts'] else ''}"
               f"{st['pieces']} closed pieces unioned")
         print(f"  tier 1: {r['tris']} triangles, {r['open_edges']} open edges, "
               f"{r['edges_3plus']} shared by 3+, {r['flipped_edges']} flipped, "

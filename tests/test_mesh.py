@@ -44,3 +44,17 @@ def test_tier1_provenance(flat, solid, part):
     # Studs survive the union with their own provenance.
     names = {inst.name for iid in np.unique(s.tri_instance) for inst in f.chain(int(iid))}
     assert any(n.startswith("stud") for n in names)
+
+
+def test_tier1_6377(flat):
+    """Duplo track 4x8: the first part that needed edge sorting, tolerant welding,
+    loop splitting and double-wall cuts.  Tier 2/3 STEP is not valid yet: a
+    connector hole is tangent to a cavity wall."""
+    f = flat("6377.dat")
+    s = solidify(f)
+    r = validate(s, f)
+    assert r["ok"], r
+    assert r["volume_ldu3"] == pytest.approx(310539.4526, abs=1e-2)
+    assert s.stats["sorted_edges"] == 2
+    assert s.stats["loops_split"] == 38
+    assert s.stats["double_wall_cuts"] == 6

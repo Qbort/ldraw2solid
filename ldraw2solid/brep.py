@@ -283,7 +283,9 @@ def _plan_lift(c: _Cyl, v, tris, loops, nb_of, normals, cyl_regions, tol):
 
     -> (info dict, '') when it can, (None, reason) when it stays faceted.
     """
-    pts = np.unique(tris)
+    # The face is rebuilt from its height and angle ranges, so only boundary
+    # vertices matter; interior ones (left by a cut, say) may be off the circle.
+    pts = np.unique(np.concatenate(loops)) if loops else np.unique(tris)
     h, ang, rad = _cyl_coords(c, v[pts])
     on = np.abs(rad - c.r) <= tol
     v0, v1 = h.min(), h.max()

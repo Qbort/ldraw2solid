@@ -106,12 +106,21 @@ Every triangle is emitted counter-clockwise seen from outside. `inverted` is the
 
 Pieces of an LDraw part touch without sharing edges: a stud stands on the top face, a tube ends against the underside of the top plate. `solidify`:
 
-1. welds vertices at 0.001 LDU;
+1. welds vertices closer than 0.0005 LDU on every axis. It uses eight grids shifted by half a cell, because a single rounding grid splits close pairs that straddle a cell boundary (6377 has vertices 0.0005 LDU apart in different cells);
 2. splits T-junctions on open edges;
-3. caps every open loop: loops on one plane are triangulated together, so nested loops give a ring; a non-planar loop is fanned to its centroid;
-4. unions the resulting closed pieces with manifold3d, with each triangle's source index as its face ID.
+3. pairs each edge's two faces. Where more than two faces meet an edge (a rib whose top edge also touches a wall), it sorts them by angle around the edge and pairs only neighbours with material between them. The rest stay open;
+4. splits the mesh into pieces connected through paired edges, each with its own vertices;
+5. caps every open loop of each piece:
+   - loops on one plane are triangulated together, so nested loops give a ring;
+   - a non-planar loop is split along chords into planar pieces (a box missing two adjacent faces leaves an L-shaped loop), or fanned to its centroid if that fails;
+6. unions the closed pieces with manifold3d, with each triangle's source index as its face ID.
 
-A cap lies on the surface it rests against, so the union removes it and cuts the matching hole into that surface. A cap that survives the union fails validation. The union runs with a precision of 0.001 LDU because library coordinates have 4 decimals: without it, 3700's pin cap leaves slivers about 1e-4 LDU wide.
+A cap lies on the surface it rests against, so the union removes it and cuts the matching hole into that surface. When caps survive:
+
+- a split loop is capped again as a fan, and the version with fewer leftover caps is kept. 3700's pin meets a curved surface: its planar pieces stick out, its fan does not;
+- the result is then cut along each leftover cap's plane and the halves are joined again. This removes zero-thickness double walls, where a piece rests against another part of itself (6377's rails against a cross-wall), which the union cannot see.
+
+A cap that still survives fails validation. The union runs with a precision of 0.001 LDU because library coordinates have 4 decimals: without it, 3700's pin cap leaves slivers about 1e-4 LDU wide.
 
 ### Tiers 2 and 3: STEP (`ldraw2solid/brep.py`)
 
@@ -159,7 +168,8 @@ Cylinders are counted per face: in 3062b two stacked primitives on the same cyli
 - `resolution="lo"` is accepted but does nothing yet.
 - Colours stay as LDraw colour codes. `LDConfig.ldr` is not read.
 - `!TEXMAP` is ignored, which gives the untextured fallback geometry.
-- Tiers 1–3 have only been run on the three reference parts, not on the library.
+- Tiers 1–3 have only been run on the three reference parts and 6377, not on the library.
+- 6377 (Duplo track) passes Tier 1 but not Tier 2/3. A connector hole is tangent to a cavity wall, so on the underside face a hole outline touches the cavity opening at one point, and OpenCASCADE rejects the face.
 - Tier 3 lifts cylinders only. Cones, spheres and tori stay faceted, as do cylinders that meet another cylinder or an oblique plane.
 - On 3001 the Tier 3 volume differs from the expected value by 2e-4 mm³ (3062b: 8e-9, 3700: 5e-5). The cause is not confirmed. A likely candidate is vertices the union places on polygon edges with its 0.001 LDU precision.
 
