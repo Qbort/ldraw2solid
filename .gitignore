@@ -1,0 +1,13 @@
+# LDraw parts library (~500 MB, distributed separately)
+/lib/
+
+# Generated output
+/out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
