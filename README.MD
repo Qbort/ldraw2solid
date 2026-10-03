@@ -120,7 +120,9 @@ A cap lies on the surface it rests against, so the union removes it and cuts the
 - a split loop is capped again as a fan, and the version with fewer leftover caps is kept. 3700's pin meets a curved surface: its planar pieces stick out, its fan does not;
 - the result is then cut along each leftover cap's plane and the halves are joined again. This removes zero-thickness double walls, where a piece rests against another part of itself (6377's rails against a cross-wall), which the union cannot see.
 
-A cap that still survives fails validation. The union runs with a precision of 0.001 LDU because library coordinates have 4 decimals: without it, 3700's pin cap leaves slivers about 1e-4 LDU wide.
+A cap that still survives fails validation.
+
+Finally the result is welded once more and collapsed triangles are dropped. The union can place a vertex 1e-6 LDU from an existing one: valid by index, but in a float32 STL the two merge and a slicer reports degenerate facets and edges with four faces. `validate` repeats its edge checks on the mesh as a slicer reads it (float32 mm, vertices merged by position). The union runs with a precision of 0.001 LDU because library coordinates have 4 decimals: without it, 3700's pin cap leaves slivers about 1e-4 LDU wide.
 
 ### Tiers 2 and 3: STEP (`ldraw2solid/brep.py`)
 

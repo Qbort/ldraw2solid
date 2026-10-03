@@ -74,6 +74,9 @@ def main():
         print(f"  tier 1: {r['tris']} triangles, {r['open_edges']} open edges, "
               f"{r['edges_3plus']} shared by 3+, {r['flipped_edges']} flipped, "
               f"{r['self_intersections']} self-intersections")
+        x = r["export"]
+        print(f"          as STL (float32): {x['collapsed']} collapsed triangles, {x['open_edges']} open edges, "
+              f"{x['edges_3plus']} shared by 3+, {x['flipped_edges']} flipped")
         print(f"          volume {r['volume_ldu3'] * 0.4 ** 3:.1f} mm^3, bounds error {r['bounds_err_ldu']:.2g} LDU, "
               f"caps left {r['cap_tris_left']}   -> {'OK' if r['ok'] else 'NOT VALID'}")
         failed += not r["ok"]

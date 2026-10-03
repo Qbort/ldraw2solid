@@ -393,6 +393,7 @@ def solidify(flat: Flat, tol: float = WELD_TOL) -> Solid:
     solid = best["solid"]
     if best["left"]:
         solid = _cut_double_walls(best, tol)
+    solid = _drop_needles(solid, tol)
     solid.stats.update({"welded_tris": int(keep.sum()), "tjunction_verts": n_tj,
                         "sorted_edges": n_sorted, "loops": sum(len(c[2]) for c in comps),
                         "loops_retried": len(retry) if best is not first else 0})
@@ -422,6 +423,20 @@ def _cut_double_walls(u: dict, tol: float, max_planes: int = 64) -> Solid:
     v, f, fid = _mesh_of(result)
     stats = dict(u["solid"].stats, double_wall_cuts=len(planes))
     return Solid(v, f, allsrc[fid], allinst[fid], stats)
+
+
+def _drop_needles(solid: Solid, tol: float) -> Solid:
+    """Weld the union result and drop the triangles that collapse.
+
+    The union can place a new vertex 1e-6..1e-5 LDU from an existing one.  The
+    mesh is valid by index, but in a float32 STL the two become one point, so a
+    slicer sees collapsed triangles and edges with four faces.  Welding at the
+    same tolerance as the input removes each needle together with its partner
+    across the short edge.
+    """
+    v, f, keep = weld(solid.verts[solid.faces], tol)
+    stats = dict(solid.stats, needles_dropped=int((~keep).sum()))
+    return Solid(v, f[keep], solid.tri_source[keep], solid.tri_instance[keep], stats)
 
 
 def _mesh_of(man):
@@ -528,8 +543,24 @@ def self_intersections(verts: np.ndarray, faces: np.ndarray) -> int:
     return count
 
 
+def export_check(solid: Solid) -> dict:
+    """The mesh as a slicer reads it: float32 mm, vertices merged by position."""
+    t = solid.to_print_frame()[solid.faces].astype(np.float32)
+    _, inv = np.unique(t.reshape(-1, 3), axis=0, return_inverse=True)
+    f = inv.reshape(-1, 3)
+    collapsed = (f[:, 0] == f[:, 1]) | (f[:, 1] == f[:, 2]) | (f[:, 0] == f[:, 2])
+    f = f[~collapsed]
+    o, _, more = edge_use(f)
+    he = np.stack([f, np.roll(f, -1, axis=1)], axis=2).reshape(-1, 2)
+    return {"collapsed": int(collapsed.sum()), "open_edges": o, "edges_3plus": more,
+            "flipped_edges": len(he) - len(np.unique(he, axis=0))}
+
+
 def validate(solid: Solid, flat: Flat) -> dict:
-    """Checks a Tier 1 solid. `ok` is true only when every check passes."""
+    """Checks a Tier 1 solid. `ok` is true only when every check passes.
+
+    `export` repeats the edge checks on the float32 STL a slicer would read.
+    """
     f, v = solid.faces, solid.verts
     o, two, more = edge_use(f)
     he = np.stack([f, np.roll(f, -1, axis=1)], axis=2).reshape(-1, 2)
@@ -541,9 +572,10 @@ def validate(solid: Solid, flat: Flat) -> dict:
     r = {"tris": len(f), "open_edges": o, "edges_3plus": more, "flipped_edges": flipped,
          "volume_ldu3": signed_volume(v, f), "bounds_err_ldu": bounds_err,
          "cap_tris_left": int(caps.sum()), "cap_area_left": float(area[caps].sum()),
-         "self_intersections": self_intersections(v, f)}
+         "self_intersections": self_intersections(v, f), "export": export_check(solid)}
     r["ok"] = (o == 0 and more == 0 and flipped == 0 and r["volume_ldu3"] > 0
-               and bounds_err < WELD_TOL and r["cap_tris_left"] == 0 and r["self_intersections"] == 0)
+               and bounds_err < WELD_TOL and r["cap_tris_left"] == 0 and r["self_intersections"] == 0
+               and not any(r["export"].values()))
     return r
 
 
