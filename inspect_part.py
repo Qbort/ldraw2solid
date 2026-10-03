@@ -5,42 +5,13 @@ usage: inspect_part.py LIBRARY_ROOT PART [PART ...] [--hi] [--stl DIR]
 """
 import argparse
 import os
-import struct
 from collections import Counter
 
 import numpy as np
 
 from ldraw2solid import Library, Flattener, surfaces
-from ldraw2solid.primitives import bare
-
-
-def tri_normals_area(t):
-    n = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
-    a = np.linalg.norm(n, axis=1) / 2
-    return n, a
-
-
-def topology(tris, tol=1e-3):
-    """Weld vertices on a grid and count how many faces meet at each edge."""
-    v = np.round(tris.reshape(-1, 3) / tol).astype(np.int64)
-    _, idx = np.unique(v, axis=0, return_inverse=True)
-    f = idx.reshape(-1, 3)
-    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
-    e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
-    _, counts = np.unique(e, axis=0, return_counts=True)
-    return int((counts == 1).sum()), int((counts == 2).sum()), int((counts > 2).sum())
-
-
-def write_stl(path, tris):
-    n, _ = tri_normals_area(tris)
-    ln = np.linalg.norm(n, axis=1, keepdims=True)
-    n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 0)
-    with open(path, "wb") as fh:
-        fh.write(b"ldraw2solid raw flatten (not yet watertight)".ljust(80, b" "))
-        fh.write(struct.pack("<I", len(tris)))
-        rec = np.zeros(len(tris), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
-        rec["n"], rec["v"] = n, tris
-        fh.write(rec.tobytes())
+from ldraw2solid.mesh import topology, tri_normals_area, write_stl
+from ldraw2solid.primitives import bare, hole_boss_mismatches
 
 
 def report(fl, name, flat, stl_dir=None):
@@ -93,24 +64,12 @@ def report(fl, name, flat, stl_dir=None):
         print(f"    {c:3d} x {g}")
 
     # Does 'hole vs boss' from INVERTNEXT bookkeeping agree with real geometry?
-    bad = 0
-    for iid, s in surf.items():
-        if s.kind != "cylinder" or not s.exact:
-            continue
-        t = flat.tris[flat.tri_instance == iid]
-        nn, _ = tri_normals_area(t)
-        ax = s.axis / (np.linalg.norm(s.axis) or 1)
-        rel = t.mean(axis=1) - s.origin
-        radial = rel - np.outer(rel @ ax, ax)
-        outward = np.einsum("ij,ij->i", nn, radial) > 0
-        if outward.mean() > 0.5 and s.inverted or outward.mean() < 0.5 and not s.inverted:
-            bad += 1
-    print(f"  hole/boss flag vs. actual triangle normals: {bad} mismatches")
+    print(f"  hole/boss flag vs. actual triangle normals: {hole_boss_mismatches(flat, surf)} mismatches")
 
     if stl_dir:
         os.makedirs(stl_dir, exist_ok=True)
         p = os.path.join(stl_dir, bare(name) + "_raw.stl")
-        write_stl(p, flat.to_print_frame())
+        write_stl(p, flat.to_print_frame(), b"ldraw2solid raw flatten (not yet watertight)")
         print(f"  wrote {p}")
 
 

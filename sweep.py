@@ -2,7 +2,7 @@ import os, sys, time, json
 from collections import Counter
 import numpy as np
 from ldraw2solid import Library, Flattener, surfaces
-from inspect_part import topology, tri_normals_area
+from ldraw2solid.mesh import topology, tri_normals_area
 lib = Library('lib'); fl = Flattener(lib)
 names = sorted(f for f in os.listdir('lib/parts') if f.lower().endswith('.dat'))
 t0=time.time(); err=Counter(); n=0; empty=0; wt=0; cert=0; miss=0

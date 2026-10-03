@@ -161,3 +161,21 @@ def surfaces(flat: Flat) -> dict:
         if s is not None:
             out[int(iid)] = s
     return out
+
+
+def hole_boss_mismatches(flat: Flat, surf: Optional[dict] = None) -> int:
+    """Exact cylinders whose `inverted` flag disagrees with their triangle normals."""
+    surf = surfaces(flat) if surf is None else surf
+    bad = 0
+    for iid, s in surf.items():
+        if s.kind != "cylinder" or not s.exact:
+            continue
+        t = flat.tris[flat.tri_instance == iid]
+        nn = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        ax = s.axis / (np.linalg.norm(s.axis) or 1)
+        rel = t.mean(axis=1) - s.origin
+        radial = rel - np.outer(rel @ ax, ax)
+        outward = np.einsum("ij,ij->i", nn, radial) > 0
+        if outward.mean() > 0.5 and s.inverted or outward.mean() < 0.5 and not s.inverted:
+            bad += 1
+    return bad

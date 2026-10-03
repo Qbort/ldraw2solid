@@ -1,0 +1,11 @@
+# Parser (ldraw2solid/parser.py, primitives.py)
+numpy
+
+# Tier 1 watertight mesh (ldraw2solid/mesh.py)
+manifold3d>=3.0
+
+# Tier 2/3 STEP export
+cadquery-ocp
+
+# Tests
+pytest
