@@ -50,3 +50,41 @@ def test_tier2_provenance(solid, part):
     b = brep.faceted_brep(solid(part))
     assert len(b.face_regions) == TIER2_FACES[part]
     assert all(ids and min(ids) >= 0 for ids in b.face_regions)
+
+
+# Tier 3 face types, measured when it first passed. In 3700 the underside pin
+# and the half cylinder it cuts into stay faceted: they meet along a saddle.
+TIER3_FACES = {
+    "3001.dat": {"plane": 25, "cylinder": 14},
+    "3062b.dat": {"plane": 5, "cylinder": 5},
+    "3700.dat": {"plane": 47, "cylinder": 7},
+}
+TIER3_FACETED = {"3001.dat": 0, "3062b.dat": 0, "3700.dat": 2}
+
+
+@pytest.mark.parametrize("part", REFERENCE_PARTS)
+def test_tier3_step_roundtrip(flat, solid, tmp_path, part):
+    s = solid(part)
+    _, bounds = brep.mesh_reference(s)
+    b = brep.analytic_brep(s, flat(part))
+    assert len(b.stats["cylinders_faceted"]) == TIER3_FACETED[part]
+    path = str(tmp_path / "part.step")
+    brep.write_step(path, b.shape)
+    r = brep.check(brep.read_step(path), b.stats["expected_volume_mm3"], bounds)
+    assert r["valid"]
+    assert r["solids"] == 1 and r["shells"] == 1
+    assert r["free_edges"] == 0
+    # Measured worst case 2e-4 mm^3 (3001), against a volume of 2535 mm^3.
+    assert r["volume_err_mm3"] < 1e-3
+    assert r["bounds_err_mm"] < 1e-6
+    assert r["face_types"] == TIER3_FACES[part]
+
+
+@pytest.mark.parametrize("part", REFERENCE_PARTS)
+def test_tier3_lifting_adds_circle_segments(flat, solid, part):
+    """True cylinders differ from the 16-gon by the circle segments, in the right direction."""
+    s = solid(part)
+    vol, _ = brep.mesh_reference(s)
+    b = brep.analytic_brep(s, flat(part))
+    assert b.stats["expected_volume_mm3"] == pytest.approx(vol + b.stats["volume_delta_mm3"], abs=0.05)
+    assert all(ids and min(ids) >= 0 for ids in b.face_regions)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn LDraw parts into closed solids and report the validation numbers.
 
-usage: make_solid.py LIBRARY_ROOT PART [PART ...] [--out DIR] [--stl] [--3mf] [--step] [--tier 2]
+usage: make_solid.py LIBRARY_ROOT PART [PART ...] [--out DIR] [--stl] [--3mf] [--step] [--tier 2|3]
 """
 import argparse
 import os
@@ -12,15 +12,20 @@ from ldraw2solid.mesh import SolidifyError, solidify, validate, write_3mf, write
 from ldraw2solid.primitives import bare
 
 
-def step(solid, part, out, tier) -> bool:
+def step(solid, flat, part, out, tier) -> bool:
     """Build the STEP solid, write it, read it back and check the file."""
     from ldraw2solid import brep
     vol, bounds = brep.mesh_reference(solid)
     try:
-        b = brep.faceted_brep(solid)
+        b = brep.analytic_brep(solid, flat) if tier == 3 else brep.faceted_brep(solid)
     except brep.BrepError as e:
         print(f"  tier {tier} FAILED: {e}")
         return False
+    if tier == 3:
+        vol = b.stats["expected_volume_mm3"]
+        why = ", ".join(sorted(set(b.stats["cylinders_faceted"])))
+        print(f"  tier 3: {b.stats['cylinders_lifted']} cylinders lifted, "
+              f"{len(b.stats['cylinders_faceted'])} kept faceted" + (f" ({why})" if why else ""))
     os.makedirs(out, exist_ok=True)
     p = os.path.join(out, bare(part) + ".step")
     brep.write_step(p, b.shape, bare(part))
@@ -30,7 +35,7 @@ def step(solid, part, out, tier) -> bool:
     types = ", ".join(f"{n} {k}" for k, n in sorted(r["face_types"].items()))
     print(f"  tier {tier}: {r['faces']} faces ({types}), {r['solids']} solid, {r['free_edges']} free edges, "
           f"{'valid' if r['valid'] else 'INVALID'}")
-    print(f"          volume {r['volume_mm3']:.1f} mm^3 (mesh differs by {r['volume_err_mm3']:.2g}), "
+    print(f"          volume {r['volume_mm3']:.1f} mm^3 (expected differs by {r['volume_err_mm3']:.2g}), "
           f"bounds error {r['bounds_err_mm']:.2g} mm   -> {'OK' if ok else 'NOT VALID'}")
     print(f"  wrote {p}")
     return ok
@@ -45,8 +50,8 @@ def main():
     ap.add_argument("--stl", action="store_true", help="write the Tier 1 mesh as STL")
     ap.add_argument("--3mf", dest="tmf", action="store_true", help="write the Tier 1 mesh as 3MF")
     ap.add_argument("--step", action="store_true", help="write a STEP solid (needs OCP)")
-    ap.add_argument("--tier", type=int, choices=(2,), default=2,
-                    help="STEP tier: 2 = planar facets")
+    ap.add_argument("--tier", type=int, choices=(2, 3), default=3,
+                    help="STEP tier: 2 = planar facets, 3 = true cylinders where possible (default)")
     a = ap.parse_args()
 
     fl = Flattener(Library(a.library, "hi" if a.hi else "std"))
@@ -82,7 +87,7 @@ def main():
                 write_3mf(p, v, solid.faces, bare(part))
                 print(f"  wrote {p}")
         if a.step:
-            failed += not step(solid, part, a.out, a.tier)
+            failed += not step(solid, flat, part, a.out, a.tier)
     sys.exit(1 if failed else 0)
 
 

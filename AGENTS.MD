@@ -12,20 +12,26 @@ Convert LDraw parts into solids for 3D printing. The target is a STEP file with 
 ldraw2solid/
   parser.py       Library lookup, per-file parsing, recursive flattening with provenance
   primitives.py   Primitive name -> analytic surface, placed in model coordinates
+  mesh.py         Tier 1: weld, T-junctions, caps, manifold3d union, validation, STL/3MF
+  brep.py         Tiers 2 and 3: OpenCASCADE faces and solid, checks, STEP read/write
 inspect_part.py   CLI report for individual parts, optional raw STL dump
+make_solid.py     CLI: Tier 1 mesh and Tier 2/3 STEP, with validation report
 sweep.py          Runs every part in the library and prints summary statistics
+tests/            pytest: parser reference values and Tiers 1–3 on the reference parts
 lib/              LDraw parts library (not in git, see below)
 out/              Generated files (not in git)
 ```
 
 ## Setup and commands
 
-- Python 3.10+, numpy. Nothing else is required for the current code.
+- Python 3.10+. The parser needs numpy only. `mesh.solidify` needs `manifold3d`, and `brep.py` needs `cadquery-ocp`. Install everything into `.venv` with `.venv/bin/pip install -r requirements.txt` (system pip is externally managed).
 - The LDraw library must be at `./lib` (unpacked `complete.zip` from library.ldraw.org, containing `parts/` and `p/`). It is about 500 MB. Never commit it, and never commit `out/`.
+- Run the tests: `.venv/bin/python -m pytest` (they skip if the library is missing; set `LDRAW_LIB` to point elsewhere)
+- Make and check solids: `.venv/bin/python make_solid.py lib 3001.dat 3062b.dat 3700.dat --step` (exit code 1 if any check fails)
 - Check three reference parts: `python3 inspect_part.py lib 3001.dat 3062b.dat 3700.dat`
 - Check the whole library: `python3 sweep.py` (about 5 minutes, must finish with `errors {}`)
 
-There is no test suite yet. Until there is one, the two commands above are the regression check. Adding pytest tests that pin the reference values below is welcome.
+The tests and the sweep are the regression check.
 
 ## Reference values
 
@@ -39,7 +45,18 @@ Any change to the parser must keep these:
 
 Stud cylinders must come out as radius 2.4 mm, height 1.6 mm. The library sweep must flatten all parts with no exceptions and no missing subfiles.
 
-Tier 1 work is expected to bring open edges to 0. It must not change bounds.
+Solids (pinned in `tests/test_mesh.py` and `tests/test_brep.py`):
+
+| Part | Tier 1 triangles | Tier 1 volume (LDU³) | Tier 2 faces | Tier 3 faces | Tier 3 cylinders faceted |
+|---|---|---|---|---|---|
+| 3001.dat | 964 | 39390.2532 | 249 planes | 25 planes, 14 cylinders | 0 |
+| 3062b.dat | 384 | 4641.2796 | 85 planes | 5 planes, 5 cylinders | 0 |
+| 3700.dat | 682 | 12101.5283 | 159 planes | 47 planes, 7 cylinders | 2 (pin joint) |
+
+Every tier must keep:
+- bounds unchanged;
+- 1 valid solid with 0 free edges, after reading the STEP back;
+- a Tier 1 mesh with 0 open edges, 0 flipped edges, 0 self-intersections and no leftover caps.
 
 ## Invariants
 
@@ -81,4 +98,4 @@ Do not break these. Later stages depend on them.
 
 ## Next task
 
-Tier 1 on 3001 and 3700: weld vertices, split T-junctions, resolve the stud-on-surface overlaps, remove internal faces, and reach 0 open edges with provenance intact. See the roadmap in `README.md` for what follows.
+Run Tiers 1–3 over the library and add the results to `sweep.py`: how many parts solidify, why the others fail, and how many cylinders Tier 3 lifts. Design the next Tier 3 surfaces (cones, cylinder–cylinder joints like the 3700 pin) around what that measures. See the roadmap in `README.md`.
