@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Tiers 2 and 3: every reference part becomes one valid STEP solid."""
 import pytest
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Tiers 2 and 3: build an OpenCASCADE solid from a Tier 1 mesh and write STEP.
 

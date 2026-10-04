@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Tier 1: turn a flattened LDraw part into one closed, oriented triangle mesh.
 

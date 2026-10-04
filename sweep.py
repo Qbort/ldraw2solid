@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 import os, sys, time, json
 from collections import Counter
 import numpy as np

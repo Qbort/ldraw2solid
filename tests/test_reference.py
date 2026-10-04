@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Parser reference values from AGENTS.MD. Any parser change must keep these."""
 import numpy as np
 import pytest

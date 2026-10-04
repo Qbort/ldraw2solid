@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Flatten LDraw parts and report what the parser recovered.
 
 usage: inspect_part.py LIBRARY_ROOT PART [PART ...] [--hi] [--stl DIR]

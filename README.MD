@@ -198,8 +198,12 @@ Cylinders are counted per face: in 3062b two stacked primitives on the same cyli
 
 ## Licence
 
-The code licence has not been chosen yet.
+Copyright (C) 2026 Roberto Fernandez Bautista
 
-The LDraw parts library is distributed separately under its own terms (CC BY 4.0 for current files; see `CAreadme.txt` in the library). Geometry produced by this tool is derived from those part files.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details. The full text is in [LICENSE](LICENSE).
+
+The LDraw parts library is not part of this project. It is distributed under its own terms (CC BY 4.0 for current files; see `CAreadme.txt` in the library), and models made with this tool are derived from those part files.
 
 LDraw is a trademark of the Estate of James Jessiman. LEGO is a trademark of the LEGO Group, which does not sponsor or endorse this project.
