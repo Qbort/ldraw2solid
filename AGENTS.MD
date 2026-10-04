@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for coding agents working in this repository. Read `README.md` first for what the project does and where it stands.
+Guidance for coding agents working in this repository. Read `README.MD` for what the project does and `docs/TECHNICAL.md` for how it works and where it stands.
 
 ## Goal
 
@@ -98,4 +98,4 @@ Do not break these. Later stages depend on them.
 
 ## Next task
 
-Run Tiers 1–3 over the library and add the results to `sweep.py`: how many parts solidify, why the others fail, and how many cylinders Tier 3 lifts. Design the next Tier 3 surfaces (cones, cylinder–cylinder joints like the 3700 pin) around what that measures. See the roadmap in `README.md`.
+Run Tiers 1–3 over the library and add the results to `sweep.py`: how many parts solidify, why the others fail, and how many cylinders Tier 3 lifts. Design the next Tier 3 surfaces (cones, cylinder–cylinder joints like the 3700 pin) around what that measures. See the roadmap in `docs/TECHNICAL.md`.
