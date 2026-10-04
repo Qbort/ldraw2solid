@@ -285,6 +285,46 @@ def _planar_pieces(verts, loop, tol, max_len: int = 200):
     return None if rest is None else [best[0]] + rest
 
 
+def _clean_triangulate(poly: list, idx: list, tol: float):
+    """Triangulate planar cap loops after cleaning them with a 2D union.
+
+    Split loops can leave chords of two nested loops on one line, running in
+    opposite directions (6377: a stepped tube's inner and outer cap at y = 4).
+    That zero-width slit is not a valid polygon: the triangulator returns
+    overlapping triangles and manifold3d then invents faces around them.  The
+    union removes slits; its points are mapped back to the loop vertices.  It is
+    used only when the plain triangulation overlaps itself (its area exceeds the
+    region's) or has zero-height triangles, which manifold3d removes by swapping
+    edges into faces off the surface.  If a point matches no loop vertex the
+    plain triangulation is kept.
+    -> (triangles into the returned vertex ids, vertex ids)
+    """
+    import manifold3d as mf
+
+    flat_idx = np.concatenate(idx)
+    flat_pts = np.concatenate(poly)
+    raw = np.asarray(mf.triangulate(poly))
+    t = flat_pts[raw]
+    areas = np.abs((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
+                   - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1])) / 2
+    longest = np.linalg.norm(t - np.roll(t, -1, axis=1), axis=2).max(axis=1)
+    region = mf.CrossSection(poly, mf.FillRule.Positive)
+    # A slit shows as overlapping triangles or as zero-height ones along it.
+    if areas.sum() <= region.area() + tol * tol and (areas > tol * longest).all():
+        return raw, flat_idx                       # clean polygons: keep them as they are
+    clean = [p for p in region.to_polygons() if len(p) >= 3]
+    ids = []
+    for p in clean:
+        d = np.linalg.norm(p[:, None, :] - flat_pts[None, :, :], axis=2)
+        near = d.argmin(axis=1)
+        if (d[np.arange(len(p)), near] > tol).any():
+            return raw, flat_idx
+        ids.append(flat_idx[near])
+    if not clean:
+        return np.zeros((0, 3), dtype=np.int64), flat_idx
+    return np.asarray(mf.triangulate(clean)), np.concatenate(ids)
+
+
 def cap_loops(verts, loops, tol: float = WELD_TOL, fan=()):
     """Faces that close the given loops, running against their open edges.
 
@@ -329,9 +369,10 @@ def cap_loops(verts, loops, tol: float = WELD_TOL, fan=()):
                    for p in poly)
         if area < 0:                                       # triangulate wants outer loops CCW
             poly = [p * [1.0, -1.0] for p in poly]
-        tri = np.asarray(mf.triangulate(poly))
-        faces.append(np.concatenate(idx)[tri])
-        face_loop.append(np.concatenate([[i] * len(loop) for loop, i in group])[tri[:, 0]])
+        tri, ids = _clean_triangulate(poly, idx, tol)
+        faces.append(ids[tri])
+        loop_of = {v: i for loop, i in group for v in loop}
+        face_loop.append(np.array([loop_of[x] for x in ids[tri[:, 0]]], dtype=np.int64))
     for loop, i in fanned:
         k = len(verts) + len(extra)
         extra.append(verts[loop].mean(0))
@@ -341,6 +382,112 @@ def cap_loops(verts, loops, tol: float = WELD_TOL, fan=()):
     face_loop = np.concatenate(face_loop) if face_loop else np.zeros(0, dtype=np.int64)
     extra = np.array(extra, dtype=float).reshape(-1, 3)
     return faces, extra, face_loop, split
+
+
+def _plane_frame(n: np.ndarray):
+    e1 = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    return e1, np.cross(n, e1)
+
+
+def _cancel_self_contact(V, F, ids, tol: float = WELD_TOL):
+    """Remove zero-thickness double walls inside one closed piece.
+
+    A piece can rest against itself: 6377's rail segments end against a
+    cross-wall they are joined to elsewhere, so the segment's cap lies flat on
+    the wall, facing the other way.  manifold3d assumes a piece never overlaps
+    itself and invents faces around such a contact.  Here, in each plane that
+    holds faces of both orientations, their overlap is cut out of both sides
+    and the rest re-triangulated.  T-junctions this leaves on neighbouring
+    edges are split afterwards.  A new triangle keeps the id of the original
+    triangle it lies in.
+    -> (V, F, ids, number of planes changed); the input comes back unchanged
+       when the result would not be closed.
+    """
+    import manifold3d as mf
+
+    n, area = tri_normals_area(V[F])
+    good = area > 1e-12
+    nu = np.zeros_like(n)
+    nu[good] = n[good] / np.linalg.norm(n[good], axis=1, keepdims=True)
+    lead = np.take_along_axis(nu, np.argmax(np.abs(nu) > 1e-6, axis=1)[:, None], axis=1)[:, 0]
+    side = np.where(lead < 0, -1, 1)
+    key_n = nu * side[:, None]
+    d = np.einsum("ij,ij->i", key_n, V[F[:, 0]])
+    groups = defaultdict(list)
+    for t in np.flatnonzero(good):
+        groups[(*np.round(key_n[t], 4).tolist(), round(float(d[t]) / tol))].append(t)
+
+    drop, new_f, new_ids, new_v = set(), [], [], []
+    changed = 0
+    for key, ts in groups.items():
+        ts = np.array(ts)
+        if len(set(side[ts].tolist())) < 2:
+            continue
+        kn = np.array(key[:3]) / np.linalg.norm(key[:3])
+        e1, e2 = _plane_frame(kn)
+        origin = kn * d[ts[0]]
+
+        def flat2d(t, flip):
+            q = (V[F[t]] - origin) @ np.c_[e1, e2]
+            return q[::-1] if flip else q
+
+        plus = [t for t in ts if side[t] > 0]
+        minus = [t for t in ts if side[t] < 0]
+        reg_p = mf.CrossSection([flat2d(t, False) for t in plus], mf.FillRule.Positive)
+        reg_m = mf.CrossSection([flat2d(t, True) for t in minus], mf.FillRule.Positive)
+        overlap = reg_p ^ reg_m
+        if overlap.area() < tol * tol:
+            continue
+        changed += 1
+        drop.update(ts.tolist())
+        local = {tuple(np.round((V[x] - origin) @ np.c_[e1, e2], 6)): x for x in np.unique(F[ts])}
+        for region, src_tris, flip in ((reg_p - overlap, plus, False), (reg_m - overlap, minus, True)):
+            polys = [p for p in region.to_polygons() if len(p) >= 3]
+            if not polys:
+                continue
+            tri = np.asarray(mf.triangulate(polys))
+            pts = np.concatenate(polys)
+            idx = []
+            for q in pts:
+                k = local.get(tuple(np.round(q, 6)))
+                if k is None:                      # nearest existing vertex, else a new one
+                    cand = np.array(list(local.values()))
+                    dist = np.linalg.norm((V[cand] - origin) @ np.c_[e1, e2] - q, axis=1)
+                    if dist.min() <= tol:
+                        k = cand[np.argmin(dist)]
+                    else:
+                        k = len(V) + len(new_v)
+                        new_v.append(origin + q[0] * e1 + q[1] * e2)
+                        local[tuple(np.round(q, 6))] = k
+                idx.append(k)
+            faces2 = np.array(idx)[tri]
+            if flip:
+                faces2 = faces2[:, ::-1]
+            # provenance: the original triangle of this orientation holding the centroid
+            for f2, c2 in zip(faces2, pts[tri].mean(1)):
+                owner = src_tris[0]
+                for t in src_tris:
+                    a, b, c = flat2d(t, flip)
+                    s1 = (b[0] - a[0]) * (c2[1] - a[1]) - (b[1] - a[1]) * (c2[0] - a[0])
+                    s2 = (c[0] - b[0]) * (c2[1] - b[1]) - (c[1] - b[1]) * (c2[0] - b[0])
+                    s3 = (a[0] - c[0]) * (c2[1] - c[1]) - (a[1] - c[1]) * (c2[0] - c[0])
+                    if min(s1, s2, s3) >= -1e-9:
+                        owner = t
+                        break
+                new_f.append(f2)
+                new_ids.append(ids[owner])
+    if not changed:
+        return V, F, ids, 0
+    keep = np.array([t not in drop for t in range(len(F))])
+    V2 = np.concatenate([V, np.array(new_v).reshape(-1, 3)])
+    F2 = np.concatenate([F[keep], np.array(new_f, dtype=F.dtype).reshape(-1, 3)])
+    ids2 = np.concatenate([ids[keep], np.array(new_ids, dtype=ids.dtype)])
+    F2, ids2, _ = split_t_junctions(V2, F2, ids2, tol)
+    o, _, more = edge_use(F2)
+    if o or more:
+        return V, F, ids, 0
+    return V2, F2, ids2, changed
 
 
 # ----------------------------------------------------------------------------
@@ -456,7 +603,7 @@ def _union(flat, verts, faces, src, he, comps, tol, fan):
     allf, allsrc, allinst, n_all = [faces], [src], [flat.tri_instance[src]], len(faces)
     cap_key = [np.full(len(faces), -1)]                 # global loop number per face
     keys, split_keys = [], set()
-    pieces, piece_vol, n_split, n_fan = [], [], 0, 0
+    pieces, piece_vol, n_split, n_fan, n_contact = [], [], 0, 0, 0
     for ci, (comp, open_h, loops) in enumerate(comps):
         base = len(keys)
         keys += [(ci, li) for li in range(len(loops))]
@@ -477,6 +624,8 @@ def _union(flat, verts, faces, src, he, comps, tol, fan):
         ids = np.concatenate([comp, np.arange(n_all, n_all + len(cap_f))])
         n_all += len(cap_f)
         piece = np.concatenate([faces[comp], cap_f])
+        verts, piece, ids, k = _cancel_self_contact(verts, piece, ids, tol)
+        n_contact += k
         used, local = np.unique(piece, return_inverse=True)
         mesh = mf.Mesh64(np.array(verts[used], dtype=np.float64, order="C"),
                          np.array(local.reshape(-1, 3), dtype=np.uint64, order="C"),
@@ -500,6 +649,7 @@ def _union(flat, verts, faces, src, he, comps, tol, fan):
     left = cap_key[fid][allsrc[fid] < 0]
     _, area = tri_normals_area(out_v[out_f])
     stats = {"loops_split": n_split, "loops_fanned": n_fan, "double_wall_cuts": 0,
+             "self_contact_planes": n_contact,
              "cap_tris": int(sum(len(f) for f in allf[1:])), "pieces": len(pieces)}
     return {"solid": Solid(out_v, out_f, allsrc[fid], allinst[fid], stats),
             "left": {keys[k] for k in left.tolist()}, "split": split_keys,
@@ -606,6 +756,49 @@ def separate_pinches(solid: Solid, nudge: float = WELD_TOL) -> Solid:
     return Solid(v, f, solid.tri_source, solid.tri_instance, dict(solid.stats, pinches_separated=len(pins)))
 
 
+def _point_tri_distance(p: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Distance from point p to each triangle in T (m, 3, 3)."""
+    a, b, c = T[:, 0], T[:, 1], T[:, 2]
+    ab, ac = b - a, c - a
+    n = np.cross(ab, ac)
+    nn = np.einsum("ij,ij->i", n, n) + 1e-30
+    h = np.einsum("ij,ij->i", p - a, n) / nn
+    q = p - h[:, None] * n
+    w = q - a
+    d00, d01, d11 = (np.einsum("ij,ij->i", ab, ab), np.einsum("ij,ij->i", ab, ac),
+                     np.einsum("ij,ij->i", ac, ac))
+    d20, d21 = np.einsum("ij,ij->i", w, ab), np.einsum("ij,ij->i", w, ac)
+    den = d00 * d11 - d01 * d01 + 1e-30
+    v = (d11 * d20 - d01 * d21) / den
+    u = (d00 * d21 - d01 * d20) / den
+    dist = np.where((v >= 0) & (u >= 0) & (v + u <= 1), np.abs(h) * np.sqrt(nn), np.inf)
+    for x, y in ((a, b), (b, c), (c, a)):
+        e = y - x
+        t = np.clip(np.einsum("ij,ij->i", p - x, e) / (np.einsum("ij,ij->i", e, e) + 1e-30), 0, 1)
+        dist = np.minimum(dist, np.linalg.norm(x + t[:, None] * e - p, axis=1))
+    return dist
+
+
+def off_surface(solid: Solid, flat: Flat, tol: float = WELD_TOL) -> int:
+    """Triangles (caps aside) with a point farther than tol from every LDraw triangle.
+
+    The union may cut and re-triangulate faces, but every point it outputs
+    must lie on the input surface.  manifold3d invents faces when a piece
+    overlaps itself (6377's rails and stud strips); this catches that.
+    """
+    src = flat.tris
+    lo, hi = src.min(1) - tol, src.max(1) + tol
+    bad = 0
+    for t in np.flatnonzero(solid.tri_source >= 0):
+        tri = solid.verts[solid.faces[t]]
+        m = np.all((lo <= tri.max(0)) & (hi >= tri.min(0)), axis=1)
+        cand = src[m]
+        pts = np.vstack([tri.mean(0), (tri + np.roll(tri, -1, axis=0)) / 2])
+        if not len(cand) or any(_point_tri_distance(p, cand).min() > tol for p in pts):
+            bad += 1
+    return bad
+
+
 def export_check(solid: Solid) -> dict:
     """The mesh as a slicer reads it: float32 mm, vertices merged by position."""
     t = solid.to_print_frame()[solid.faces].astype(np.float32)
@@ -636,9 +829,11 @@ def validate(solid: Solid, flat: Flat) -> dict:
          "volume_ldu3": signed_volume(v, f), "bounds_err_ldu": bounds_err,
          "cap_tris_left": int(caps.sum()), "cap_area_left": float(area[caps].sum()),
          "self_intersections": self_intersections(v, f), "export": export_check(solid),
-         "pinch_vertices": len(pinch_fans(f))}          # reported, not an error
+         "pinch_vertices": len(pinch_fans(f)),          # reported, not an error
+         "off_surface": off_surface(solid, flat)}
     r["ok"] = (o == 0 and more == 0 and flipped == 0 and r["volume_ldu3"] > 0
                and bounds_err < WELD_TOL and r["cap_tris_left"] == 0 and r["self_intersections"] == 0
+               and r["off_surface"] == 0
                and not any(r["export"].values()))
     return r
 

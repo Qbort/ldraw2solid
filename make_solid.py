@@ -77,7 +77,7 @@ def main():
               f"{st['pieces']} closed pieces unioned")
         print(f"  tier 1: {r['tris']} triangles, {r['open_edges']} open edges, "
               f"{r['edges_3plus']} shared by 3+, {r['flipped_edges']} flipped, "
-              f"{r['self_intersections']} self-intersections")
+              f"{r['self_intersections']} self-intersections, {r['off_surface']} off the LDraw surface")
         x = r["export"]
         print(f"          as STL (float32): {x['collapsed']} collapsed triangles, {x['open_edges']} open edges, "
               f"{x['edges_3plus']} shared by 3+, {x['flipped_edges']} flipped")

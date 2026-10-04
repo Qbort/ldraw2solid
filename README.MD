@@ -118,9 +118,13 @@ Pieces of an LDraw part touch without sharing edges: a stud stands on the top fa
 A cap lies on the surface it rests against, so the union removes it and cuts the matching hole into that surface. When caps survive:
 
 - a split loop is capped again as a fan, and the version with fewer leftover caps is kept. 3700's pin meets a curved surface: its planar pieces stick out, its fan does not;
-- the result is then cut along each leftover cap's plane and the halves are joined again. This removes zero-thickness double walls, where a piece rests against another part of itself (6377's rails against a cross-wall), which the union cannot see.
+- as a fallback, the result is cut along each leftover cap's plane and the halves are joined again, which removes zero-thickness double walls.
 
-A cap that still survives fails validation.
+Before the union, two cases are fixed inside each piece, because manifold3d assumes a piece never overlaps itself. When it does, manifold3d invents faces that are not on the input; in 6377 these turned the fins under the rails into wedges.
+- **A piece resting against itself.** 6377's rail segments end against a cross-wall they are joined to elsewhere. In every plane that holds faces of both orientations, the overlap is cut out of both sides with a 2D polygon difference and the rest is re-triangulated.
+- **Cap slits.** The split caps of a stepped tube can put the chords of two nested loops on one line, running in opposite directions. Such a zero-width slit makes the triangulator return overlapping or zero-height triangles. Those cap planes are cleaned with a 2D union before triangulating.
+
+A cap that still survives fails validation. So does any output triangle with a point more than 0.001 LDU from every LDraw triangle (`off_surface`): the union may cut faces up, but never move them.
 
 Finally the result is welded once more and collapsed triangles are dropped. The union can place a vertex 1e-6 LDU from an existing one: valid by index, but in a float32 STL the two merge and a slicer reports degenerate facets and edges with four faces. `validate` repeats its edge checks on the mesh as a slicer reads it (float32 mm, vertices merged by position). The union runs with a precision of 0.001 LDU because library coordinates have 4 decimals: without it, 3700's pin cap leaves slivers about 1e-4 LDU wide.
 

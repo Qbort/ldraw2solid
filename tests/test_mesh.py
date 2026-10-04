@@ -31,6 +31,7 @@ def test_tier1_valid(flat, solid, part):
     assert r["flipped_edges"] == 0
     assert r["self_intersections"] == 0
     assert r["cap_tris_left"] == 0
+    assert r["off_surface"] == 0
     assert r["bounds_err_ldu"] < 1e-3
     assert r["volume_ldu3"] == pytest.approx(VOLUME[part], abs=1e-3)
     assert r["ok"]
@@ -47,14 +48,15 @@ def test_tier1_provenance(flat, solid, part):
 
 
 def test_tier1_6377(flat):
-    """Duplo track 4x8: the first part that needed edge sorting, tolerant welding,
-    loop splitting and double-wall cuts.  Tier 2/3 STEP is not valid yet: a
-    connector hole is tangent to a cavity wall."""
+    """Duplo track 4x8: needs edge sorting, tolerant welding, loop splitting and
+    cancelling the places where a piece lies flat against itself."""
     f = flat("6377.dat")
     s = solidify(f)
     r = validate(s, f)
     assert r["ok"], r
-    assert r["volume_ldu3"] == pytest.approx(310539.4526, abs=1e-2)
+    assert r["off_surface"] == 0
+    assert r["volume_ldu3"] == pytest.approx(315239.0716, abs=1e-2)
     assert s.stats["sorted_edges"] == 2
     assert s.stats["loops_split"] == 38
-    assert s.stats["double_wall_cuts"] == 6
+    assert s.stats["self_contact_planes"] == 6
+    assert s.stats["double_wall_cuts"] == 0
