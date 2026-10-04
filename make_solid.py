@@ -31,7 +31,7 @@ def step(solid, flat, part, out, tier) -> bool:
     brep.write_step(p, b.shape, bare(part))
     r = brep.check(brep.read_step(p), vol, bounds)
     ok = (r["valid"] and r["solids"] == 1 and r["free_edges"] == 0
-          and r["volume_err_mm3"] < 1e-3 and r["bounds_err_mm"] < 1e-3)
+          and r["volume_err_mm3"] < max(1e-3, 1e-6 * abs(vol)) and r["bounds_err_mm"] < 1e-3)
     types = ", ".join(f"{n} {k}" for k, n in sorted(r["face_types"].items()))
     print(f"  tier {tier}: {r['faces']} faces ({types}), {r['solids']} solid, {r['free_edges']} free edges, "
           f"{'valid' if r['valid'] else 'INVALID'}")

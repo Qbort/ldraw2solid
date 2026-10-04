@@ -15,12 +15,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from OCP.BRep import BRep_Tool
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace,
                                 BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeSolid,
-                                BRepBuilderAPI_MakeWire, BRepBuilderAPI_Sewing)
+                                BRepBuilderAPI_MakeVertex, BRepBuilderAPI_Sewing)
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepLib import BRepLib
@@ -35,11 +35,11 @@ from OCP.ShapeFix import ShapeFix_Shape
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS
+from OCP.TopoDS import TopoDS, TopoDS_Wire
 from OCP.Geom import Geom_CylindricalSurface
 from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 
-from .mesh import Solid, tri_normals_area, signed_volume
+from .mesh import Solid, separate_pinches, signed_volume, tri_normals_area
 from .parser import Flat, LDRAW_TO_ZUP, LDU_TO_MM
 from .primitives import surfaces
 
@@ -98,29 +98,115 @@ def planar_regions(verts: np.ndarray, faces: np.ndarray, tol: float = PLANE_TOL,
     return np.unique(roots, return_inverse=True)[1].reshape(-1)
 
 
-def region_loops(faces: np.ndarray, labels: np.ndarray, em: dict | None = None) -> dict:
-    """{region: [loop, ...]}: boundary vertex loops, in the triangles' winding."""
+def region_loops(faces: np.ndarray, labels: np.ndarray, em: dict | None = None,
+                 verts: np.ndarray | None = None) -> dict:
+    """{region: [loop, ...]}: boundary vertex loops, in the triangles' winding.
+
+    A face can touch itself at a vertex (6377: two cavities meeting at a
+    corner).  There, with `verts`, the walk takes the outgoing edge first
+    clockwise from the way back, seen from the face's normal, which keeps
+    following the same patch of face; the loop then passes that vertex twice,
+    which OCC accepts.
+    """
     em = _edge_map(faces) if em is None else em
-    nxt = defaultdict(dict)
+    nxt = defaultdict(lambda: defaultdict(list))         # region -> vertex -> next vertices
     for (a, b), t in em.items():
         if labels[em[(b, a)]] != labels[t]:
-            if a in nxt[labels[t]]:
-                raise BrepError(f"region {labels[t]} touches itself at vertex {a}")
-            nxt[labels[t]][a] = b
+            nxt[labels[t]][a].append(b)
+    normal = {}
+    if verts is not None:
+        n, _ = tri_normals_area(verts[faces])
+        for r in nxt:
+            m = n[labels == r].sum(0)
+            normal[r] = m / (np.linalg.norm(m) or 1)
     out = {}
     for r, step in nxt.items():
+        # Successor of each boundary edge (u, x): the edge leaving x picked by
+        # the turn rule.  Loops are the cycles of this map.
+        succ = {(u, x): (x, _choose(verts, normal.get(r), u, x, step[x], r))
+                for u, outs in list(step.items()) for x in outs}
         loops, seen = [], set()
-        for start in step:
-            if start in seen:
+        for h in succ:
+            if h in seen:
                 continue
-            loop, v = [], start
-            while v not in seen:
-                seen.add(v)
-                loop.append(v)
-                v = step[v]
+            loop = []
+            while h not in seen:
+                seen.add(h)
+                loop.append(h[0])
+                h = succ[h]
             loops.append(loop)
         out[int(r)] = loops
     return out
+
+
+def _choose(verts, n, u, x, outs, r):
+    """Outgoing edge from x after arriving from u: the first clockwise from x->u."""
+    if len(outs) == 1:
+        return outs[0]
+    if verts is None:
+        raise BrepError(f"region {r} touches itself at vertex {x}")
+    e1 = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+
+    def ang(w):
+        d = verts[w] - verts[x]
+        return np.arctan2(d @ e2, d @ e1)
+
+    back = ang(u)
+    return min(outs, key=lambda w: (back - ang(w)) % (2 * np.pi) or 2 * np.pi)
+
+
+def touch_points(v: np.ndarray, loops: dict, tol: float = PLANE_TOL) -> np.ndarray:
+    """Boundary vertices that lie inside another boundary edge.
+
+    6377 has a connector hole tangent to a cavity wall: the hole's polygon has a
+    vertex on the middle of the wall's edge.  OCC rejects a face whose boundary
+    touches an edge like that, but accepts a wire that passes the same vertex
+    twice, so these vertices are inserted into the edges they touch.
+    """
+    ids = np.unique(np.concatenate([np.concatenate(ls) for ls in loops.values() if ls]))
+    P = v[ids]
+    hits = set()
+    for ls in loops.values():
+        for loop in ls:
+            for a, b in zip(loop, loop[1:] + loop[:1]):
+                m = _on_segment(v[a], v[b], P, tol)
+                hits.update(ids[m].tolist())
+    return np.array(sorted(hits), dtype=np.int64)
+
+
+def _on_segment(pa, pb, P, tol):
+    """Mask of points P strictly inside segment pa-pb (within tol)."""
+    lo, hi = np.minimum(pa, pb) - tol, np.maximum(pa, pb) + tol
+    m = np.all((P >= lo) & (P <= hi), axis=1)
+    if not m.any():
+        return m
+    d = pb - pa
+    length = float(np.linalg.norm(d))
+    q = P[m]
+    t = (q - pa) @ d / (length * length)
+    near = (np.linalg.norm(pa + t[:, None] * d - q, axis=1) < tol) & (t * length > tol) & ((1 - t) * length > tol)
+    m[np.flatnonzero(m)[~near]] = False
+    return m
+
+
+def _with_pins(v, seq, pins, tol, closed=True):
+    """`seq` with any pin vertex lying inside one of its edges inserted there.
+
+    A closed loop also gets its closing edge checked; an open run keeps its end.
+    """
+    if not len(pins):
+        return list(seq)
+    pairs = zip(seq, seq[1:] + seq[:1]) if closed else zip(seq[:-1], seq[1:])
+    out = []
+    for a, b in pairs:
+        out.append(a)
+        m = _on_segment(v[a], v[b], v[pins], tol)
+        if m.any():
+            d = v[b] - v[a]
+            out += pins[m][np.argsort((v[pins[m]] - v[a]) @ d)].tolist()
+    return out if closed else out + [seq[-1]]
 
 
 # ----------------------------------------------------------------------------
@@ -140,8 +226,9 @@ def _wire(points: np.ndarray):
     return poly.Wire()
 
 
-def _planar_face(verts: np.ndarray, loops: list, normal: np.ndarray):
+def _planar_face(verts: np.ndarray, loops: list, normal: np.ndarray, pins=()):
     """Face on the best-fit plane; the loop with positive area is the outer one."""
+    loops = [_with_pins(verts, l, np.asarray(pins, dtype=np.int64), PLANE_TOL) for l in loops]
     pts = np.concatenate([verts[l] for l in loops])
     c = pts.mean(0)
     e1 = np.cross(normal, [1.0, 0, 0] if abs(normal[0]) < 0.9 else [0, 1.0, 0])
@@ -194,10 +281,12 @@ class Brep:
 
 def faceted_brep(solid: Solid) -> Brep:
     """Tier 2: one planar face per connected coplanar group of triangles."""
+    solid = separate_pinches(solid)
     v = solid.to_print_frame()
     f = solid.faces
     labels = planar_regions(v, f)
-    loops = region_loops(f, labels)
+    loops = region_loops(f, labels, verts=v)
+    pins = touch_points(v, loops)
     n, area = tri_normals_area(v[f])
     occ_faces, prov, max_dev = [], [], 0.0
     for r in range(labels.max() + 1):
@@ -206,10 +295,11 @@ def faceted_brep(solid: Solid) -> Brep:
         normal /= np.linalg.norm(normal)
         pts = v[np.unique(f[m])]
         max_dev = max(max_dev, float(np.abs((pts - pts.mean(0)) @ normal).max()))
-        occ_faces.append(_planar_face(v, loops[r], normal))
+        occ_faces.append(_planar_face(v, loops[r], normal, pins))
         prov.append(set(np.unique(solid.tri_instance[m]).tolist()))
     shape = _solid_from_faces(occ_faces)
-    return Brep(shape, prov, {"faces": len(occ_faces), "max_plane_dev_mm": max_dev})
+    return Brep(shape, prov, {"faces": len(occ_faces), "max_plane_dev_mm": max_dev,
+                              "touch_points": len(pins)})
 
 
 # ----------------------------------------------------------------------------
@@ -310,7 +400,9 @@ def _plan_lift(c: _Cyl, v, tris, loops, nb_of, normals, cyl_regions, tol):
                 return None, "boundary is not a circle or a straight generator"
     if set(pts[~on].tolist()) - dropped:
         return None, "vertex off the circle"
-    angles = np.unique(np.round(np.mod(ang[on], 2 * np.pi), 6))
+    # Rounding only groups vertices at one angle; it must stay far below the
+    # sewing tolerance, or the face's straight edges land beside their neighbours.
+    angles = np.unique(np.round(np.mod(ang[on], 2 * np.pi), 9))
     gaps = np.diff(np.concatenate([angles, angles[:1] + 2 * np.pi]))
     if len(loops) == 2 and lines == 0:
         full, u0, span, nseg = True, 0.0, 2 * np.pi, len(angles)
@@ -338,7 +430,8 @@ def _cyl_face(info):
     return TopoDS.Face(face.Reversed()) if c.hole else face
 
 
-def _arc_edge(c: _Cyl, pts: np.ndarray, closed: bool):
+def _arc_edge(c: _Cyl, pts: np.ndarray, closed: bool, va=None, vb=None):
+    """Arc of the cylinder's circle through `pts`, from va to vb when given."""
     h = float((pts[0] - c.origin) @ c.d)
     centre = c.origin + h * c.d
     rel = pts - centre
@@ -346,37 +439,63 @@ def _arc_edge(c: _Cyl, pts: np.ndarray, closed: bool):
     # A full circle starts at the cylinder face's seam, so sewing need not split it.
     x = _frame(c.d)[0] if closed else rel[0] / np.linalg.norm(rel[0])
     circ = gp_Circ(gp_Ax2(_pnt(centre), gp_Dir(*c.d.tolist()), gp_Dir(*x.tolist())), c.r)
+    a = va if va is not None else _pnt(pts[0])
+    b = vb if vb is not None else _pnt(pts[-1])
     if closed:
         mk = BRepBuilderAPI_MakeEdge(circ)
     elif ccw:
-        mk = BRepBuilderAPI_MakeEdge(circ, _pnt(pts[0]), _pnt(pts[-1]))
+        mk = BRepBuilderAPI_MakeEdge(circ, a, b)
     else:
-        mk = BRepBuilderAPI_MakeEdge(circ, _pnt(pts[-1]), _pnt(pts[0]))
+        mk = BRepBuilderAPI_MakeEdge(circ, b, a)
     if not mk.IsDone():
         raise BrepError(f"could not build an arc edge (error {mk.Error()})")
     e = mk.Edge()
     return e if ccw else TopoDS.Edge(e.Reversed())
 
 
-def _mixed_wire(v, loop, nb, lifted, tol):
-    """Wire for one planar-face loop; runs along a lifted cylinder become arcs or one line."""
-    mw = BRepBuilderAPI_MakeWire()
-    for run, r in _runs(loop, nb):
-        pts = v[run]
+def _mixed_wire(v, loop, nb, lifted, tol, pins=np.zeros(0, dtype=np.int64)):
+    """Wire for one planar-face loop; runs along a lifted cylinder become arcs or one line.
+
+    Runs also break at pin vertices (see `touch_points`), and pins lying inside
+    a straight edge are inserted into it.
+    """
+    pinned = set(pins.tolist()) | {x for x in loop if loop.count(x) > 1}
+    breaks = [i for i, x in enumerate(loop) if x in pinned]
+    # Block number changes at each pin; the stretch after the last pin wraps
+    # round to the first block, so a loop start that is no pin is no break.
+    block = [sum(1 for j in breaks if j <= i) % max(len(breaks), 1) for i in range(len(loop))]
+    # Segments in loop order: ('arc', cylinder, points) or ('line', points).
+    segs = []
+    for run, (r, _) in _runs(loop, list(zip(nb, block))):
         info = lifted.get(r)
-        if info is not None and np.ptp((pts - info["cyl"].origin) @ info["cyl"].d) < tol:
-            mw.Add(_arc_edge(info["cyl"], pts, run[0] == run[-1]))
-        elif info is not None:
-            mw.Add(BRepBuilderAPI_MakeEdge(_pnt(pts[0]), _pnt(pts[-1])).Edge())
+        if info is not None and np.ptp((v[run] - info["cyl"].origin) @ info["cyl"].d) < tol:
+            segs.append(("arc", info["cyl"], v[run], run[0] == run[-1]))
+            continue
+        if info is not None:
+            run = [run[0], run[-1]]
+        pts = v[_with_pins(v, run, pins, tol, closed=False)]
+        segs += [("line", None, pts[i:i + 2], False) for i in range(len(pts) - 1)]
+    # Build the wire from explicit vertices, one per position along the loop.
+    # MakeWire would join edges by position and so fuse the two visits of a
+    # point the loop passes twice (a tangent hole), which OCC then rejects.
+    builder = BRep_Builder()
+    wire = TopoDS_Wire()
+    builder.MakeWire(wire)
+    if len(segs) == 1 and segs[0][3]:
+        builder.Add(wire, _arc_edge(segs[0][1], segs[0][2], True))
+        return wire
+    verts = [BRepBuilderAPI_MakeVertex(_pnt(seg[2][0])).Vertex() for seg in segs]
+    for i, (kind, cyl, pts, _) in enumerate(segs):
+        va, vb = verts[i], verts[(i + 1) % len(segs)]
+        if kind == "arc":
+            builder.Add(wire, _arc_edge(cyl, pts, False, va, vb))
         else:
-            for p, q in zip(pts[:-1], pts[1:]):
-                mw.Add(BRepBuilderAPI_MakeEdge(_pnt(p), _pnt(q)).Edge())
-    if not mw.IsDone():
-        raise BrepError(f"could not build a wire (error {mw.Error()})")
-    return mw.Wire()
+            builder.Add(wire, BRepBuilderAPI_MakeEdge(va, vb).Edge())
+    wire.Closed(True)
+    return wire
 
 
-def _mixed_planar_face(v, loops, nbs, normal, lifted, tol):
+def _mixed_planar_face(v, loops, nbs, normal, lifted, tol, pins=np.zeros(0, dtype=np.int64)):
     pts = np.concatenate([v[l] for l in loops])
     c = pts.mean(0)
     e1, e2 = _frame(normal)
@@ -391,10 +510,10 @@ def _mixed_planar_face(v, loops, nbs, normal, lifted, tol):
     if areas[outer] <= 0 or sum(a > 0 for a in areas) != 1:
         raise BrepError(f"face loops do not form one outer boundary with holes (areas {areas})")
     pln = gp_Pln(_pnt(c), gp_Dir(*map(float, normal)))
-    mk = BRepBuilderAPI_MakeFace(pln, _mixed_wire(v, loops[outer], nbs[outer], lifted, tol), True)
+    mk = BRepBuilderAPI_MakeFace(pln, _mixed_wire(v, loops[outer], nbs[outer], lifted, tol, pins), True)
     for i, l in enumerate(loops):
         if i != outer:
-            mk.Add(_mixed_wire(v, l, nbs[i], lifted, tol))
+            mk.Add(_mixed_wire(v, l, nbs[i], lifted, tol, pins))
     if not mk.IsDone():
         raise BrepError("could not build a planar face")
     return mk.Face()
@@ -409,6 +528,7 @@ def analytic_brep(solid: Solid, flat: Flat, tol: float = PLANE_TOL) -> Brep:
     moved onto the true circle (by at most `tol`) before any face is built,
     so every face sees the same coordinates.
     """
+    solid = separate_pinches(solid)
     v = solid.to_print_frame()
     f = solid.faces
     cyl_of = _cylinders_mm(flat)
@@ -417,7 +537,7 @@ def analytic_brep(solid: Solid, flat: Flat, tol: float = PLANE_TOL) -> Brep:
 
     def regions(keys):
         labels = planar_regions(v, f, tol, keys)
-        loops = region_loops(f, labels, em)
+        loops = region_loops(f, labels, em, v)
         normals = {}
         for r in range(labels.max() + 1):
             s = n[labels == r].sum(0)
@@ -460,20 +580,21 @@ def analytic_brep(solid: Solid, flat: Flat, tol: float = PLANE_TOL) -> Brep:
         if k is not None:
             lifted[int(labels[t])] = lift1[k]
     nb_of = nb_fn(labels)
+    pins = touch_points(v, loops, tol)
     occ_faces, prov = [], []
     for r in range(labels.max() + 1):
         if r in lifted:
             occ_faces.append(_cyl_face(lifted[r]))
         else:
             occ_faces.append(_mixed_planar_face(v, loops[r], [nb_of(l) for l in loops[r]],
-                                                normals[r], lifted, tol))
+                                                normals[r], lifted, tol, pins))
         prov.append(set(np.unique(solid.tri_instance[labels == r]).tolist()))
     shape = _solid_from_faces(occ_faces, 1e-6)
     # Expected volume: the mesh after snapping, plus the slivers between each
     # lifted cylinder and its polygon.
     delta = float(sum(i["volume_delta"] for i in lifted.values()))
     return Brep(shape, prov, {
-        "faces": len(occ_faces), "cylinders_lifted": len(lifted),
+        "faces": len(occ_faces), "cylinders_lifted": len(lifted), "touch_points": len(pins),
         "cylinders_faceted": sorted(fallback.values()),
         "volume_delta_mm3": delta, "expected_volume_mm3": signed_volume(v, f) + delta})
 
@@ -545,5 +666,6 @@ def read_step(path: str):
 
 def mesh_reference(solid: Solid):
     """(volume mm^3, (lo, hi) mm) of the Tier 1 mesh in the print frame."""
+    solid = separate_pinches(solid)
     v = solid.to_print_frame()
     return signed_volume(v, solid.faces), (v.min(0), v.max(0))

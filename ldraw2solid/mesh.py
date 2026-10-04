@@ -543,6 +543,66 @@ def self_intersections(verts: np.ndarray, faces: np.ndarray) -> int:
     return count
 
 
+def pinch_fans(faces: np.ndarray) -> dict:
+    """{vertex: [face groups]} for vertices where the surface touches itself.
+
+    Around a normal vertex the faces form one fan linked through shared edges;
+    two or more fans mean separate sheets meeting at a single point.
+    """
+    inc = defaultdict(list)
+    for t, tri in enumerate(faces.tolist()):
+        for x in tri:
+            inc[x].append(t)
+    out = {}
+    for x, ts in inc.items():
+        parent = {t: t for t in ts}
+
+        def find(a):
+            while parent[a] != a:
+                a = parent[a]
+            return a
+
+        by_neighbour = defaultdict(list)
+        for t in ts:
+            for y in faces[t].tolist():
+                if y != x:
+                    by_neighbour[y].append(t)
+        for tt in by_neighbour.values():
+            for a in tt[1:]:
+                parent[find(a)] = find(tt[0])
+        groups = defaultdict(list)
+        for t in ts:
+            groups[find(t)].append(t)
+        if len(groups) > 1:
+            out[x] = list(groups.values())
+    return out
+
+
+def separate_pinches(solid: Solid, nudge: float = 1e-5) -> Solid:
+    """Give each sheet meeting at a pinch vertex its own copy, moved `nudge` LDU into its sheet.
+
+    Slicers accept a surface that touches itself at a point, and so does OCC in
+    memory, but OCC's STEP import splits such a vertex and leaves wires open.
+    Moving each copy a few nanometres into its own fan makes the solid manifold.
+    """
+    pins = pinch_fans(solid.faces)
+    if not pins:
+        return solid
+    v, f = solid.verts.copy(), solid.faces.copy()
+    for x, groups in pins.items():
+        base = v[x].copy()
+        moved = []
+        for g in groups:
+            d = v[np.unique(f[g][f[g] != x])].mean(0) - base
+            moved.append(base + nudge * d / np.linalg.norm(d))
+        v[x] = moved[0]
+        for g, p in zip(groups[1:], moved[1:]):
+            v = np.vstack([v, p])
+            for t in g:
+                f[t][f[t] == x] = len(v) - 1
+    return Solid(v, f, solid.tri_source, solid.tri_instance, dict(solid.stats, pinches_separated=len(pins)))
+
+
 def export_check(solid: Solid) -> dict:
     """The mesh as a slicer reads it: float32 mm, vertices merged by position."""
     t = solid.to_print_frame()[solid.faces].astype(np.float32)
@@ -572,7 +632,8 @@ def validate(solid: Solid, flat: Flat) -> dict:
     r = {"tris": len(f), "open_edges": o, "edges_3plus": more, "flipped_edges": flipped,
          "volume_ldu3": signed_volume(v, f), "bounds_err_ldu": bounds_err,
          "cap_tris_left": int(caps.sum()), "cap_area_left": float(area[caps].sum()),
-         "self_intersections": self_intersections(v, f), "export": export_check(solid)}
+         "self_intersections": self_intersections(v, f), "export": export_check(solid),
+         "pinch_vertices": len(pinch_fans(f))}          # reported, not an error
     r["ok"] = (o == 0 and more == 0 and flipped == 0 and r["volume_ldu3"] > 0
                and bounds_err < WELD_TOL and r["cap_tris_left"] == 0 and r["self_intersections"] == 0
                and not any(r["export"].values()))
