@@ -578,12 +578,15 @@ def pinch_fans(faces: np.ndarray) -> dict:
     return out
 
 
-def separate_pinches(solid: Solid, nudge: float = 1e-5) -> Solid:
+def separate_pinches(solid: Solid, nudge: float = WELD_TOL) -> Solid:
     """Give each sheet meeting at a pinch vertex its own copy, moved `nudge` LDU into its sheet.
 
     Slicers accept a surface that touches itself at a point, and so does OCC in
     memory, but OCC's STEP import splits such a vertex and leaves wires open.
-    Moving each copy a few nanometres into its own fan makes the solid manifold.
+    Moving each copy into its own fan makes the solid manifold.  The move has to
+    exceed OCC's vertex tolerances (up to ~1.7e-4 mm here): at 1e-5 LDU the
+    mesher merged some copies and not others, leaving slits a slicer reports
+    as open edges.
     """
     pins = pinch_fans(solid.faces)
     if not pins:

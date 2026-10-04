@@ -24,6 +24,8 @@ from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepLib import BRepLib
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopLoc import TopLoc_Location
 from OCP.Bnd import Bnd_Box
 from OCP.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus
 from OCP.GProp import GProp_GProps
@@ -368,66 +370,152 @@ def _cyl_coords(c: _Cyl, p: np.ndarray):
     return h, np.arctan2(rad @ y, rad @ x), np.linalg.norm(rad, axis=1)
 
 
-def _plan_lift(c: _Cyl, v, tris, loops, nb_of, normals, cyl_regions, tol):
-    """Decide whether one cylinder region can become a true cylinder face.
+AXIS_PARALLEL = 1e-4      # |normal . axis| below this: a wall along the cylinder
 
+
+def _polygon_angles(ang: np.ndarray, r: float, tol: float) -> np.ndarray:
+    """Distinct polygon-vertex angles (sorted, in [0, 2pi)) from vertex angles."""
+    a = np.sort(np.mod(ang, 2 * np.pi))
+    groups = [[a[0]]]
+    for x in a[1:]:
+        if x - groups[-1][-1] < tol / r:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    if len(groups) > 1 and groups[0][0] + 2 * np.pi - groups[-1][-1] < tol / r:
+        groups[0] = [x - 2 * np.pi for x in groups.pop()] + groups[0]
+    return np.mod(np.array([np.mean(g) for g in groups]), 2 * np.pi)
+
+
+def _facet_of(angles: np.ndarray, a: float) -> int:
+    """Index k of the facet [angles[k-1], angles[k]] (cyclic) that contains angle a."""
+    return int(np.searchsorted(angles, np.mod(a, 2 * np.pi)) % len(angles))
+
+
+def _on_chord(c: _Cyl, angles, h, a, rad, tol) -> bool:
+    """Is a point (height h, angle a, radius rad) on the chord of its facet?"""
+    k = _facet_of(angles, a)
+    a0, a1 = angles[k - 1], angles[k]
+    half = np.mod(a1 - a0, 2 * np.pi) / 2
+    off = np.angle(np.exp(1j * (a - (a0 + half))))           # angle from the facet's middle
+    return abs(rad * np.cos(off) - c.r * np.cos(half)) <= tol and abs(off) <= half + 1e-9
+
+
+def _plan_lift(c: _Cyl, v, tris, loops, nb_of, normals, cyl_regions, tol):
+    """Decide whether one cylinder region can become true cylinder faces.
+
+    The region is cut into facet columns (one 16-gon facet each) with their
+    height ranges; neighbouring columns with equal ranges form rectangular
+    patches in (angle, height), one cylindrical face each.  So a stepped
+    cylinder (6377: a tube that runs higher over 3/8 of its circle) lifts too.
+    Boundary vertices must be on the circle or on a facet's chord; the latter
+    occur where a flat wall continues a facet's plane, and the flat face next to
+    that facet then gains the crescent between chord and arc.
     -> (info dict, '') when it can, (None, reason) when it stays faceted.
     """
-    # The face is rebuilt from its height and angle ranges, so only boundary
-    # vertices matter; interior ones (left by a cut, say) may be off the circle.
-    pts = np.unique(np.concatenate(loops)) if loops else np.unique(tris)
+    if not loops:
+        return None, "no boundary"
+    pts = np.unique(np.concatenate(loops))
     h, ang, rad = _cyl_coords(c, v[pts])
     on = np.abs(rad - c.r) <= tol
-    v0, v1 = h.min(), h.max()
-    # The union can leave extra vertices on a polygon edge where a neighbour's
-    # triangles meet it.  They are fine inside an arc run, which drops them.
-    dropped = set()
-    lines = 0
+    if on.sum() < 3:
+        return None, "too few vertices on the circle"
+    angles = _polygon_angles(ang[on], c.r, tol)
+    for x in np.flatnonzero(~on):
+        if not _on_chord(c, angles, h[x], ang[x], rad[x], tol):
+            return None, "vertex off the circle"
+    chord_walls, crescent_takers = set(), set()     # (facet, height) pairs
+    level = lambda x: round(float(x) / tol)
     for loop in loops:
         for run, nb in _runs(loop, nb_of(loop)):
             if nb in cyl_regions:
                 return None, "meets another cylinder"
-            rh, ra, rr = _cyl_coords(c, v[run])
             along = abs(normals[nb] @ c.d)
-            if along > 1 - 1e-6 and (np.abs(rh - v0).max() < tol or np.abs(rh - v1).max() < tol):
-                closed = run[0] == run[-1]
-                if not closed and (abs(rr[0] - c.r) > tol or abs(rr[-1] - c.r) > tol):
-                    return None, "arc end off the circle"
-                dropped |= set(run) if closed else set(run[1:-1])
-            elif along < 1e-6 and np.ptp(np.unwrap(ra)) < 1e-6:
-                lines += 1
-            else:
+            rh = _cyl_coords(c, v[run])[0]
+            if along > 1 - 1e-6:
+                if np.ptp(rh) > tol:
+                    return None, "boundary on a cross plane changes height"
+                if run[0] != run[-1]:
+                    _, ea, er = _cyl_coords(c, v[[run[0], run[-1]]])
+                    for a_, r_ in zip(ea, er):
+                        if abs(r_ - c.r) > tol:
+                            crescent_takers.add((_facet_of(angles, a_), level(rh[0])))
+            elif along > AXIS_PARALLEL:
                 return None, "boundary is not a circle or a straight generator"
-    if set(pts[~on].tolist()) - dropped:
-        return None, "vertex off the circle"
-    # Rounding only groups vertices at one angle; it must stay far below the
-    # sewing tolerance, or the face's straight edges land beside their neighbours.
-    angles = np.unique(np.round(np.mod(ang[on], 2 * np.pi), 9))
-    gaps = np.diff(np.concatenate([angles, angles[:1] + 2 * np.pi]))
-    if len(loops) == 2 and lines == 0:
-        full, u0, span, nseg = True, 0.0, 2 * np.pi, len(angles)
-    elif len(loops) == 1 and lines == 2:
-        k = int(np.argmax(gaps))
-        full, u0, span, nseg = False, float(angles[(k + 1) % len(angles)]), float(2 * np.pi - gaps[k]), len(angles) - 1
+            else:
+                # Along a wall: each step is a straight generator (same angle,
+                # on the circle) or runs along a chord at one height.
+                rh, ra, rr = _cyl_coords(c, v[run])
+                for i in range(len(run) - 1):
+                    vertical = (abs(np.angle(np.exp(1j * (ra[i + 1] - ra[i])))) * c.r < tol
+                                and abs(rr[i] - c.r) <= tol and abs(rr[i + 1] - c.r) <= tol)
+                    flat_step = abs(rh[i + 1] - rh[i]) <= tol
+                    if not (vertical or flat_step):
+                        return None, "boundary is not a circle or a straight generator"
+                    if flat_step and not vertical:
+                        mid = np.angle(np.exp(1j * ra[i]) + np.exp(1j * ra[i + 1]))
+                        chord_walls.add((_facet_of(angles, mid), level(rh[i])))
+    # A wall continuing a facet's plane leaves a crescent between chord and arc
+    # once the facet is curved; a cross face must end on that chord to take it.
+    if chord_walls - crescent_takers:
+        return None, "a wall continues a facet with no face to close the gap"
+    # Facet columns and their height ranges.
+    cols = defaultdict(list)
+    for t in tris:
+        th, ta, _ = _cyl_coords(c, v[t])
+        cols[_facet_of(angles, np.angle(np.exp(1j * ta).mean()))].append((th.min(), th.max()))
+    span_of = {}
+    for k, iv in cols.items():
+        lo, hi = min(x[0] for x in iv), max(x[1] for x in iv)
+        cover = sorted(iv)
+        reach = cover[0][1]
+        for x0, x1 in cover[1:]:
+            if x0 > reach + tol:
+                return None, "a facet column has a gap"
+            reach = max(reach, x1)
+        span_of[k] = (lo, hi)
+    n = len(angles)
+    width = lambda k: np.mod(angles[k] - angles[k - 1], 2 * np.pi) or 2 * np.pi
+    same = lambda p, q: abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
+    if len(span_of) == n and all(same(span_of[k], span_of[0]) for k in span_of):
+        patches = [(0.0, 2 * np.pi, *span_of[0])]          # full band, seam at angle 0
     else:
-        return None, f"not a simple band ({len(loops)} loops, {lines} straight edges)"
-    alpha = span / nseg
-    segment = nseg * c.r ** 2 / 2 * (alpha - np.sin(alpha))   # circle minus polygon
-    delta = (v1 - v0) * segment * (-1 if c.hole else 1)
-    return {"cyl": c, "v0": v0, "v1": v1, "u0": u0, "span": span, "full": full,
-            "volume_delta": delta}, ""
+        # Start just after a column that is missing or differs from its successor.
+        starts = [k for k in range(n) if k in span_of and
+                  ((k - 1) % n not in span_of or not same(span_of[(k - 1) % n], span_of[k]))]
+        if not starts:
+            return None, "could not split into patches"
+        patches = []
+        for k0 in starts:
+            k, u_span = k0, 0.0
+            while k in span_of and same(span_of[k], span_of[k0]) and (k != k0 or u_span == 0):
+                u_span += width(k)
+                k = (k + 1) % n
+            patches.append((float(angles[k0 - 1]), float(u_span), *span_of[k0]))
+    delta = sum((hi - lo) * c.r ** 2 / 2 * (width(k) - np.sin(width(k)))
+                for k, (lo, hi) in span_of.items()) * (-1 if c.hole else 1)
+    return {"cyl": c, "angles": angles, "patches": patches, "volume_delta": delta}, ""
 
 
-def _cyl_face(info):
+def _cyl_faces(info) -> list:
+    """One cylindrical face per (angle, height) patch."""
     c = info["cyl"]
     x, _ = _frame(c.d)
     ax = gp_Ax3(_pnt(c.origin), gp_Dir(*c.d.tolist()), gp_Dir(*x.tolist()))
     surf = Geom_CylindricalSurface(ax, c.r)
-    mk = BRepBuilderAPI_MakeFace(surf, info["u0"], info["u0"] + info["span"], info["v0"], info["v1"], 1e-7)
-    if not mk.IsDone():
-        raise BrepError("could not build a cylindrical face")
-    face = mk.Face()
-    return TopoDS.Face(face.Reversed()) if c.hole else face
+    out = []
+    for u0, span, v0, v1 in info["patches"]:
+        mk = BRepBuilderAPI_MakeFace(surf, u0, u0 + span, v0, v1, 1e-7)
+        if not mk.IsDone():
+            raise BrepError("could not build a cylindrical face")
+        face = mk.Face()
+        out.append(TopoDS.Face(face.Reversed()) if c.hole else face)
+    return out
+
+
+def _circle_point(c: _Cyl, a: float, h: float) -> np.ndarray:
+    x, y = _frame(c.d)
+    return c.origin + h * c.d + c.r * (np.cos(a) * x + np.sin(a) * y)
 
 
 def _arc_edge(c: _Cyl, pts: np.ndarray, closed: bool, va=None, vb=None):
@@ -469,10 +557,10 @@ def _mixed_wire(v, loop, nb, lifted, tol, pins=np.zeros(0, dtype=np.int64)):
     for run, (r, _) in _runs(loop, list(zip(nb, block))):
         info = lifted.get(r)
         if info is not None and np.ptp((v[run] - info["cyl"].origin) @ info["cyl"].d) < tol:
-            segs.append(("arc", info["cyl"], v[run], run[0] == run[-1]))
+            segs += _arc_run(info, v, run, tol)
             continue
-        if info is not None:
-            run = [run[0], run[-1]]
+        if info is not None:                 # wall along the cylinder: keep its corners only
+            run = _corners(v, run, tol)
         pts = v[_with_pins(v, run, pins, tol, closed=False)]
         segs += [("line", None, pts[i:i + 2], False) for i in range(len(pts) - 1)]
     # Build the wire from explicit vertices, one per position along the loop.
@@ -493,6 +581,46 @@ def _mixed_wire(v, loop, nb, lifted, tol, pins=np.zeros(0, dtype=np.int64)):
             builder.Add(wire, BRepBuilderAPI_MakeEdge(va, vb).Edge())
     wire.Closed(True)
     return wire
+
+
+def _arc_run(info, v, run, tol) -> list:
+    """Segments for a run along a lifted cylinder at one height.
+
+    A run end on a facet's chord (not on the circle) is where a flat wall
+    continues that facet.  The arc then runs on to the facet's corner and a
+    straight edge comes back along the chord: this face takes the crescent
+    between chord and arc.
+    """
+    c, angles = info["cyl"], info["angles"]
+    pts = v[run]
+    if run[0] == run[-1]:
+        return [("arc", c, pts, True)]
+    h, a, rad = _cyl_coords(c, pts)
+    centre = c.origin + h[0] * c.d
+    ccw = float((np.cross(pts[:-1] - centre, pts[1:] - centre) @ c.d).sum()) > 0
+    arc, before, after = list(pts), [], []
+    if abs(rad[0] - c.r) > tol:
+        k = _facet_of(angles, a[0])
+        q = _circle_point(c, angles[k - 1] if ccw else angles[k], h[0])
+        before = [("line", None, np.array([pts[0], q]), False)]
+        arc[0] = q
+    if abs(rad[-1] - c.r) > tol:
+        k = _facet_of(angles, a[-1])
+        q = _circle_point(c, angles[k] if ccw else angles[k - 1], h[0])
+        after = [("line", None, np.array([q, pts[-1]]), False)]
+        arc[-1] = q
+    return before + [("arc", c, np.array(arc), False)] + after
+
+
+def _corners(v, run, tol) -> list:
+    """The run without vertices lying on the straight line between their neighbours."""
+    out = [run[0]]
+    for i in range(1, len(run) - 1):
+        p, q, w = v[out[-1]], v[run[i]], v[run[i + 1]]
+        d = w - p
+        if np.linalg.norm(np.cross(q - p, d)) / (np.linalg.norm(d) or 1) > tol:
+            out.append(run[i])
+    return out + [run[-1]]
 
 
 def _mixed_planar_face(v, loops, nbs, normal, lifted, tol, pins=np.zeros(0, dtype=np.int64)):
@@ -560,16 +688,19 @@ def analytic_brep(solid: Solid, flat: Flat, tol: float = PLANE_TOL) -> Brep:
         else:
             lift1[r] = info
 
-    # 2. Move boundary vertices of lifted cylinders onto the true circle.
+    # 2. Move vertices of lifted cylinders onto the true circle, at the exact
+    #    polygon angle, so a step's straight edge runs exactly along the axis.
+    #    Vertices on a chord are left alone.
     for t, r in enumerate(labels.tolist()):
         if r in lift1:
-            c = lift1[r]["cyl"]
+            info = lift1[r]
+            c = info["cyl"]
             for k in f[t]:
-                rel = v[k] - c.origin
-                h = rel @ c.d
-                rad = rel - h * c.d
-                if abs(np.linalg.norm(rad) - c.r) <= tol:     # leave dropped edge vertices alone
-                    v[k] = c.origin + h * c.d + rad / np.linalg.norm(rad) * c.r
+                h, a, rad = _cyl_coords(c, v[k][None])
+                if abs(rad[0] - c.r) <= tol:
+                    ang = info["angles"]
+                    near = ang[np.argmin(np.abs(np.angle(np.exp(1j * (ang - a[0])))))]
+                    v[k] = _circle_point(c, near, h[0])
 
     # 3. Regions again, with only the lifted cylinders kept whole.  Keying them
     #    by first-pass region keeps two separate pieces of one cylinder apart.
@@ -584,7 +715,9 @@ def analytic_brep(solid: Solid, flat: Flat, tol: float = PLANE_TOL) -> Brep:
     occ_faces, prov = [], []
     for r in range(labels.max() + 1):
         if r in lifted:
-            occ_faces.append(_cyl_face(lifted[r]))
+            faces_r = _cyl_faces(lifted[r])
+            occ_faces += faces_r
+            prov += [set(np.unique(solid.tri_instance[labels == r]).tolist())] * (len(faces_r) - 1)
         else:
             occ_faces.append(_mixed_planar_face(v, loops[r], [nb_of(l) for l in loops[r]],
                                                 normals[r], lifted, tol, pins))
@@ -640,6 +773,34 @@ def check(shape, mesh_volume_mm3: float | None = None, bounds_mm=None) -> dict:
     if bounds_mm is not None:
         r["bounds_err_mm"] = float(max(np.abs(lo - bounds_mm[0]).max(), np.abs(hi - bounds_mm[1]).max()))
     return r
+
+
+def tessellation_check(shape, deflection: float = 0.01) -> dict:
+    """The solid as a slicer sees a STEP file: meshed, then welded by float32 position.
+
+    -> {'tris', 'open_edges', 'edges_3plus'}.  A B-rep can be valid while its
+    faces mesh with slits between them (vertices a few nanometres apart).
+    """
+    BRepMesh_IncrementalMesh(shape, deflection, False, 0.2, True)
+    tris = []
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        fc = TopoDS.Face(ex.Current())
+        loc = TopLoc_Location()
+        t = BRep_Tool.Triangulation_s(fc, loc)
+        if t is not None:
+            trsf = loc.Transformation()
+            p = np.array([[q.X(), q.Y(), q.Z()] for q in
+                          (t.Node(i).Transformed(trsf) for i in range(1, t.NbNodes() + 1))])
+            idx = np.array([t.Triangle(i).Get() for i in range(1, t.NbTriangles() + 1)]) - 1
+            tris.append(p[idx])
+        ex.Next()
+    tris = np.concatenate(tris).astype(np.float32)
+    _, inv = np.unique(tris.reshape(-1, 3), axis=0, return_inverse=True)
+    f = inv.reshape(-1, 3)
+    e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+    _, cnt = np.unique(e, axis=0, return_counts=True)
+    return {"tris": len(f), "open_edges": int((cnt == 1).sum()), "edges_3plus": int((cnt > 2).sum())}
 
 
 def fix(shape):

@@ -128,7 +128,15 @@ Finally the result is welded once more and collapsed triangles are dropped. The 
 
 Tier 2 merges connected coplanar triangles into planar faces. Their boundary loops come from the closed mesh, so neighbouring faces share their vertices exactly. The faces are sewn into one solid with OpenCASCADE.
 
-Tier 3 replaces exact cylinder primitives with cylindrical faces. A cylinder is lifted only if it is a simple band whose neighbours are planes across its axis (the shared edge becomes a circle arc) or along it (a straight edge). Otherwise it stays faceted. Before any face is built, the boundary vertices of lifted cylinders are moved onto the true circle, by at most 0.001 LDU. The expected volume is the mesh volume plus the circle segments that the lifted cylinders add (bosses) or remove (holes), and the check compares against it.
+Tier 3 replaces exact cylinder primitives with cylindrical faces:
+- **Patches.** The cylinder is cut into facet columns, one 16-gon facet each, with the height range each one covers. Neighbouring columns with equal ranges form a rectangular patch in (angle, height), and each patch becomes one cylindrical face. So a stepped cylinder lifts too: 6377's tubes run higher over 3/8 of their circle.
+- **Neighbours.** A cylinder lifts only if every neighbour is a plane across its axis (the shared edge becomes an arc) or a wall along it (straight edges up the side, or along a facet's chord). Otherwise it stays faceted.
+- **Crescents.** A wall can continue a facet's plane beyond the cylinder. Once the facet is curved, the flat face across the axis that ends on that chord takes the crescent between chord and arc. If no face ends there (3700's pin continues into a joint piece), the cylinder stays faceted.
+- **Snapping.** Before any face is built, vertices of lifted cylinders are moved onto the true circle at the exact polygon angle, by at most 0.001 LDU.
+
+The expected volume is the mesh volume plus the circle segments, facet by facet, that bosses add and holes remove. The check compares against it.
+
+Points where the surface touches itself are split for STEP: each sheet gets its own copy of the vertex, moved 0.001 LDU into that sheet. OpenCASCADE's STEP import otherwise splits them itself and leaves wires open. With a smaller move, the mesher merged some copies and not others, which left slits that a slicer reports as open edges. `make_solid.py` meshes every STEP it writes the way a slicer does (float32, merged by position) and fails on open edges.
 
 ### Coordinates and units
 
@@ -171,7 +179,9 @@ Cylinders are counted per face: in 3062b two stacked primitives on the same cyli
 - Colours stay as LDraw colour codes. `LDConfig.ldr` is not read.
 - `!TEXMAP` is ignored, which gives the untextured fallback geometry.
 - Tiers 1–3 have only been run on the three reference parts and 6377, not on the library.
-- 6377 (Duplo track) passes Tier 1 but not Tier 2/3. A connector hole is tangent to a cavity wall, so on the underside face a hole outline touches the cavity opening at one point, and OpenCASCADE rejects the face.
+- 6377 (Duplo track) gives a valid Tier 2 and Tier 3 STEP, with 12 of 14 cylinders lifted:
+  - Its Tier 3 volume is 0.094 mm³ above the prediction. 0.064 mm³ comes from the two 270° connector pegs, whose faces each match theory, and the cause has not been found.
+  - The female connectors' outer half-cylinders stay faceted. They touch a cavity wall along a line, which meshes as 2 edges with 4 faces.
 - Tier 3 lifts cylinders only. Cones, spheres and tori stay faceted, as do cylinders that meet another cylinder or an oblique plane.
 - On 3001 the Tier 3 volume differs from the expected value by 2e-4 mm³ (3062b: 8e-9, 3700: 5e-5). The cause is not confirmed. A likely candidate is vertices the union places on polygon edges with its 0.001 LDU precision.
 

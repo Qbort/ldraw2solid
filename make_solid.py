@@ -29,14 +29,18 @@ def step(solid, flat, part, out, tier) -> bool:
     os.makedirs(out, exist_ok=True)
     p = os.path.join(out, bare(part) + ".step")
     brep.write_step(p, b.shape, bare(part))
-    r = brep.check(brep.read_step(p), vol, bounds)
-    ok = (r["valid"] and r["solids"] == 1 and r["free_edges"] == 0
+    rb = brep.read_step(p)
+    r = brep.check(rb, vol, bounds)
+    m = brep.tessellation_check(rb)
+    ok = (r["valid"] and r["solids"] == 1 and r["free_edges"] == 0 and m["open_edges"] == 0
           and r["volume_err_mm3"] < max(1e-3, 1e-6 * abs(vol)) and r["bounds_err_mm"] < 1e-3)
     types = ", ".join(f"{n} {k}" for k, n in sorted(r["face_types"].items()))
     print(f"  tier {tier}: {r['faces']} faces ({types}), {r['solids']} solid, {r['free_edges']} free edges, "
           f"{'valid' if r['valid'] else 'INVALID'}")
     print(f"          volume {r['volume_mm3']:.1f} mm^3 (expected differs by {r['volume_err_mm3']:.2g}), "
           f"bounds error {r['bounds_err_mm']:.2g} mm   -> {'OK' if ok else 'NOT VALID'}")
+    print(f"          meshed like a slicer: {m['open_edges']} open edges, "
+          f"{m['edges_3plus']} edges with 3+ faces (surfaces touching along a line)")
     print(f"  wrote {p}")
     return ok
 

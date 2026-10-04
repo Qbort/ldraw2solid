@@ -88,3 +88,20 @@ def test_tier3_lifting_adds_circle_segments(flat, solid, part):
     b = brep.analytic_brep(s, flat(part))
     assert b.stats["expected_volume_mm3"] == pytest.approx(vol + b.stats["volume_delta_mm3"], abs=0.05)
     assert all(ids and min(ids) >= 0 for ids in b.face_regions)
+
+
+def test_tier3_6377(flat, solid, tmp_path):
+    """Duplo track: stepped tubes underneath lift; the STEP meshes without slits."""
+    s = solid("6377.dat")
+    b = brep.analytic_brep(s, flat("6377.dat"))
+    assert b.stats["cylinders_lifted"] == 12
+    path = str(tmp_path / "part.step")
+    brep.write_step(path, b.shape)
+    shape = brep.read_step(path)
+    r = brep.check(shape)
+    assert r["valid"] and r["solids"] == 1 and r["free_edges"] == 0
+    assert r["face_types"]["cylinder"] == 16
+    m = brep.tessellation_check(shape)
+    assert m["open_edges"] == 0
+    # The female connectors' outer wall touches a cavity wall along a line.
+    assert m["edges_3plus"] == 2
